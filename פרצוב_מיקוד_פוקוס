@@ -1,3 +1,35 @@
+# ============================================================
+# Eye-Tracking Video Processor
+#
+# INPUT:
+#    - CSV file with fixations (time, X, Y, duration)
+#    - Original stimulus video (MP4)
+#
+# PROCESS:
+#    1. Clean fixation data (drop empty rows, numeric only).
+#    2. Load video and prepare writer for output.
+#    3. For each frame:
+#         → Blur background
+#         → Find active fixation (X,Y)
+#         → Draw a circular focus mask
+#         → Apply feather (soft edges) + darkness
+#         → Smooth transitions between fixations
+#         → Optional "hold last" point briefly
+#
+# OUTPUT:
+#    - New video (MP4) where only the gaze area is sharp,
+#      everything else blurred/darkened.
+#
+# Main parameters:
+#    GS = gaze circle radius
+#    B = blur strength
+#    Darkness = background dimming
+#    FEATHER = edge softness
+#    TRANSITION = smooth motion between fixations
+#
+# Result → A video that clearly shows where the participant looked.
+# ============================================================
+
 import pandas as pd
 import cv2
 import numpy as np
