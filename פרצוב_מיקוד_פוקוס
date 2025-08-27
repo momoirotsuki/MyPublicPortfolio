@@ -1,0 +1,270 @@
+import pandas as pd
+import cv2
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+###########################################
+
+# הנתיב לקובץ 
+file_path = r"C:\Users\Dimush\Desktop\E1_FixationPatterns_Lim154_IntGr2.csv"
+
+# קריאת הקובץ
+df = pd.read_csv(file_path)
+
+# הורדת כל השורות הריקות
+df_clean = df.dropna(how="all")
+
+# הדפסת כמה שורות ראשונות לוודא שנראה טוב
+print(df_clean.head())
+
+# שמירת הקובץ הנקי 
+output_path = r"C:\Users\Dimush\Desktop\E1_FixationPatterns_Lim154_IntGr2_clean.csv" # אווטפוט של נתונים נקיים
+df_clean.to_csv(output_path, index=False)
+
+print("הקובץ הנקי נשמר בהצלחה ב:", output_path)
+
+###########################################
+
+#stimulus_video מחזיק את הסרטון
+
+import cv2
+
+# הנתיב לסרטון
+video_path = r"C:\Users\Dimush\Desktop\e1.mp4" # הכתובת של הסרטון
+
+# טעינת הסרטון והגדרה בשם מסוים
+stimulus_video = cv2.VideoCapture(video_path)
+
+# בדיקה אם הסרטון נטען בהצלחה
+if not stimulus_video.isOpened():
+    print("בעיה בטעינת הסרטון")
+else:
+    print("הסרטון נטען בהצלחה תחת המשתנה stimulus_video")
+
+###########################################
+
+# ========= הגדרות קלט/פלט ופרמטרים =========
+csv_path   = r"C:\Users\Dimush\Desktop\E1_FixationPatterns_Lim154_IntGr2_clean.csv"
+video_path = r"C:\Users\Dimush\Desktop\e1.mp4"
+out_path   = r"C:\Users\Dimush\Desktop\e1_gaze_focus_E.mp4"
+
+GS        = 180   # רדיוס העיגול סביב המבט (px)
+B         = 50    # רמת טשטוש 1–100 (ימופה לגרעין odd)
+Darkness  = 70    # רמת החשכה 0–100
+
+# רכות הגבול:
+FEATHER_MODE = "percent"   # "percent" או "pixels"
+FEATHER_VAL  = 0.6       # 0 = חד, 0.4 = 40% מ-GS, או פיקסלים אם "pixels"
+
+# אופציה א' – החזק־אחרון:
+HOLD_LAST_ENABLED = True # לשנות כאן להפעלה או כיבוי
+HOLD_LAST_MS      = 60 # מ"ש לשמור את המיקוד לאחר שפיקסציה נעלמת
+
+# ========= פרמטרי אינטרפולציה בין פיקסציות =========
+TRANSITION_MS   = 60      # משך מעבר חלק בין נקודות מטרה (מילישניות)
+EASING          = "linear"   # "linear" / "ease" (ease-in-out קובי׳)
+DIST_MIN_FOR_TRANSITION = 0.25 * GS  # לא מפעילים מעבר אם הקפיצה קטנה מזה (px)
+
+###########################################
+
+# ========= קריאת טבלת הפיקסציות =========
+df = pd.read_csv(csv_path)
+
+def find_col(candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+col_T = find_col(["T (CURRENT_FIX_START)", "CURRENT_FIX_START", "T"])
+col_X = find_col(["X (CURRENT_FIX_X)", "CURRENT_FIX_X", "X"])
+col_Y = find_col(["Y (CURRENT_FIX_Y)", "CURRENT_FIX_Y", "Y"])
+col_D = find_col(["D (CURRENT_FIX_DURATION)", "CURRENT_FIX_DURATION", "D"])
+
+if not all([col_T, col_X, col_Y, col_D]):
+    raise ValueError("לא נמצאו עמודות T/X/Y/D המתאימות בקובץ.")
+
+for c in [col_T, col_X, col_Y, col_D]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df = df.dropna(subset=[col_T, col_X, col_Y, col_D]).copy()
+df[[col_T, col_D]] = df[[col_T, col_D]].astype(np.int64)
+df = df.sort_values(col_T).reset_index(drop=True)
+
+# פיקסציות ואינטרוולים
+fixations = df[[col_T, col_X, col_Y, col_D]].to_numpy()
+intervals = np.column_stack([fixations[:,0], fixations[:,0] + fixations[:,3]])
+
+###########################################
+
+# ========= וידאו והכנות =========
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    raise RuntimeError("לא הצלחתי לפתוח את קובץ הווידאו.")
+
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+
+def blur_kernel_from_B(B):
+    B = int(max(1, min(100, B)))
+    k = 3 + int((B - 1) * (98 / 99.0))  # 3..101
+    if k % 2 == 0: k += 1
+    return max(3, min(101, k))
+
+k_blur = blur_kernel_from_B(B)
+
+black = np.zeros((h, w, 3), dtype=np.uint8)
+dark_alpha = float(max(0, min(100, Darkness))) / 100.0
+
+fix_idx = 0
+num_fix = len(fixations)
+frame_idx = 0
+ms_per_frame = 1000.0 / fps
+
+###########################################
+
+# ===== מצב לאינטרפולציה =====
+last_xy = None           # נקודה אחרונה ששימשה למסכה
+last_active_end = -1     # סוף הפיקסציה האחרונה (ל־hold last)
+
+# פרטי המעבר החלק
+in_transition = False
+trans_start_ms = 0.0
+trans_end_ms   = 0.0
+trans_from_xy  = None
+trans_to_xy    = None
+
+def get_active_fixation(t_ms, start_idx):
+    i = start_idx
+    while i < num_fix and t_ms >= intervals[i, 1]:
+        i += 1
+    if i < num_fix and intervals[i, 0] <= t_ms < intervals[i, 1]:
+        return i, (fixations[i, 1], fixations[i, 2])
+    return i, None
+
+def easing_alpha(alpha):
+    alpha = max(0.0, min(1.0, alpha))
+    if EASING == "linear":
+        return alpha
+    # ease-in-out קובי׳ (smoothstep משופר)
+    return alpha * alpha * (3 - 2 * alpha)
+
+def start_transition(now_ms, from_xy, to_xy):
+    global in_transition, trans_start_ms, trans_end_ms, trans_from_xy, trans_to_xy
+    in_transition = True
+    trans_start_ms = now_ms
+    trans_end_ms   = now_ms + max(1.0, TRANSITION_MS)
+    trans_from_xy  = from_xy
+    trans_to_xy    = to_xy
+
+def get_smoothed_xy(t_ms, target_xy):
+    """
+    קובע מיקום מסכה "חלק": אם נפתח מעבר – מבצע אינטרפולציה בין from ל-to,
+    אחרת מחזיר את היעד כפי שהוא.
+    """
+    global in_transition, last_xy
+
+    if in_transition:
+        if t_ms >= trans_end_ms or trans_from_xy is None or trans_to_xy is None:
+            in_transition = False
+            last_xy = trans_to_xy
+            return last_xy
+        # יחס בזמן
+        a = (t_ms - trans_start_ms) / (trans_end_ms - trans_start_ms)
+        a = easing_alpha(a)
+        x = (1 - a) * trans_from_xy[0] + a * trans_to_xy[0]
+        y = (1 - a) * trans_from_xy[1] + a * trans_to_xy[1]
+        last_xy = (x, y)
+        return last_xy
+    else:
+        # אין מעבר פתוח – משתמשים ביעד ישיר
+        last_xy = target_xy
+        return target_xy
+
+###########################################
+
+# ========= לולאת עיבוד =========
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    t_ms = frame_idx * ms_per_frame
+    fix_idx, active = get_active_fixation(t_ms, fix_idx)
+
+    # החזק־אחרון
+    if active is not None:
+        last_active_end = intervals[fix_idx, 1]
+    elif HOLD_LAST_ENABLED and last_xy is not None and t_ms < last_active_end + HOLD_LAST_MS:
+        active = last_xy  # לא יעד "רשמי" אבל ממשיך את הנקודה הקודמת
+
+    # טשטוש רקע
+    blurred = cv2.GaussianBlur(frame, (k_blur, k_blur), 0)
+
+    if active is not None:
+        target_x = int(np.clip(active[0], 0, w - 1))
+        target_y = int(np.clip(active[1], 0, h - 1))
+        target_xy = (float(target_x), float(target_y))
+
+        # החלטה אם לפתוח מעבר חלק (כשמשתנה יעד אמיתי)
+        open_transition = False
+        if last_xy is None:
+            # התחלה ראשונה – אין צורך במעבר
+            last_xy = target_xy
+        else:
+            # אם יש שינוי משמעותי ביעד – נתחיל מעבר
+            dist = np.hypot(target_xy[0] - last_xy[0], target_xy[1] - last_xy[1])
+            if dist >= DIST_MIN_FOR_TRANSITION:
+                # פתח מעבר רק אם לא קיים כבר, או אם היעד התחלף
+                if not in_transition or (trans_to_xy is not None and target_xy != trans_to_xy):
+                    start_transition(t_ms, from_xy=last_xy, to_xy=target_xy)
+                    open_transition = True
+
+        # נקודת המסכה הסופית לפריים זה (אם מעבר פתוח – נקודת ביניים)
+        xy = get_smoothed_xy(t_ms, target_xy if not open_transition else last_xy)
+        x, y = int(np.clip(xy[0], 0, w - 1)), int(np.clip(xy[1], 0, h - 1))
+
+        # מסכה עגולה
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(mask, (x, y), int(GS), 255, thickness=-1)
+
+        # feather
+        if FEATHER_MODE == "percent":
+            feather = int(max(0, FEATHER_VAL) * GS)
+        else:
+            feather = int(max(0, FEATHER_VAL))
+        if feather > 0:
+            k = max(3, feather | 1)
+            mask_soft = cv2.GaussianBlur(mask, (k, k), 0)
+        else:
+            mask_soft = mask
+
+        m = (mask_soft.astype(np.float32) / 255.0)[..., None]
+
+        # חשיכת הרקע מחוץ למסכה
+        background = blurred.copy()
+        if dark_alpha > 0:
+            inv_m = 1.0 - m
+            dark_bg = cv2.addWeighted(background, 1.0 - dark_alpha, black, dark_alpha, 0)
+            background = (background.astype(np.float32) * m + dark_bg.astype(np.float32) * inv_m).astype(np.uint8)
+
+        comp = (frame.astype(np.float32) * m + background.astype(np.float32) * (1.0 - m)).astype(np.uint8)
+
+    else:
+        # אין יעד כלל (וגם לא hold) – רקע מטושטש ומוחשך
+        comp = blurred
+        if dark_alpha > 0:
+            comp = cv2.addWeighted(comp, 1.0 - dark_alpha, black, dark_alpha, 0)
+
+    writer.write(comp)
+    frame_idx += 1
+
+cap.release()
+writer.release()
+
+print("סיימתי ליצור את הסרטון:", out_path)
